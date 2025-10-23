@@ -2,9 +2,13 @@ services:
   - type: web
     name: ai-code-detector-api
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    region: oregon
+    plan: free
+    buildCommand: "./build.sh"
+    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 300"
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: PIP_NO_CACHE_DIR
+        value: "1"
     healthCheckPath: /health

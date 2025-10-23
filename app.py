@@ -4,11 +4,17 @@ import joblib
 import numpy as np
 import re
 import requests
+import os
+import sys
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import traceback
-import os
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for MERN frontend
@@ -69,12 +75,15 @@ class GitHubRepoAnalyzer:
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            print(f"Error fetching repo contents: {str(e)}")
+            logger.error(f"Error fetching repo contents: {str(e)}")
             return []
     
     @staticmethod
-    def get_all_python_files(owner: str, repo: str, path: str = "") -> List[Dict]:
+    def get_all_python_files(owner: str, repo: str, path: str = "", max_depth: int = 5) -> List[Dict]:
         """Recursively get all Python files from repository"""
+        if max_depth <= 0:
+            return []
+            
         python_files = []
         contents = GitHubRepoAnalyzer.get_repo_contents(owner, repo, path)
         
@@ -82,11 +91,17 @@ class GitHubRepoAnalyzer:
             return python_files
         
         for item in contents:
-            if item['type'] == 'file' and item['name'].endswith('.py'):
-                python_files.append(item)
-            elif item['type'] == 'dir':
-                subdir_files = GitHubRepoAnalyzer.get_all_python_files(owner, repo, item['path'])
-                python_files.extend(subdir_files)
+            try:
+                if item['type'] == 'file' and item['name'].endswith('.py'):
+                    python_files.append(item)
+                elif item['type'] == 'dir':
+                    subdir_files = GitHubRepoAnalyzer.get_all_python_files(
+                        owner, repo, item['path'], max_depth - 1
+                    )
+                    python_files.extend(subdir_files)
+            except Exception as e:
+                logger.warning(f"Error processing item: {str(e)}")
+                continue
         
         return python_files
     
@@ -98,7 +113,7 @@ class GitHubRepoAnalyzer:
             response.raise_for_status()
             return response.text
         except Exception as e:
-            print(f"Error downloading file: {str(e)}")
+            logger.warning(f"Error downloading file: {str(e)}")
             return None
 
 class CodeAnalyzer:
@@ -122,20 +137,28 @@ class CodeAnalyzer:
             
             for name, path in model_files.items():
                 if Path(path).exists():
-                    self.models[name] = joblib.load(path)
+                    try:
+                        self.models[name] = joblib.load(path)
+                        logger.info(f"Loaded model: {name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to load model {name}: {str(e)}")
                 else:
-                    print(f"Warning: Model {name} not found at {path}")
+                    logger.warning(f"Model {name} not found at {path}")
             
             if Path('model/vectorizer.pkl').exists():
                 self.vectorizer = joblib.load('model/vectorizer.pkl')
+                logger.info("Loaded vectorizer")
             else:
                 raise Exception("Vectorizer not found!")
             
             if Path('model/labelencoder.pkl').exists():
                 self.label_encoder = joblib.load('model/labelencoder.pkl')
+                logger.info("Loaded label encoder")
+            
+            logger.info(f"Successfully loaded {len(self.models)} models")
                 
         except Exception as e:
-            print(f"Error loading models: {str(e)}")
+            logger.error(f"Error loading models: {str(e)}")
             raise
     
     def predict_with_model(self, X: np.ndarray, model_name: str) -> Optional[ModelResult]:
@@ -164,7 +187,7 @@ class CodeAnalyzer:
             )
             
         except Exception as e:
-            print(f"Error with {model_name}: {str(e)}")
+            logger.warning(f"Error with {model_name}: {str(e)}")
             return None
     
     def analyze_code(self, code: str) -> Tuple[List[ModelResult], str, float]:
@@ -275,19 +298,22 @@ class CodeAnalyzer:
         return patterns
 
 # Initialize analyzer globally
+analyzer = None
 try:
+    logger.info("Initializing CodeAnalyzer...")
     analyzer = CodeAnalyzer()
-    print("Models loaded successfully!")
+    logger.info("Models loaded successfully!")
 except Exception as e:
-    print(f"Failed to load models: {str(e)}")
-    analyzer = None
+    logger.error(f"Failed to load models: {str(e)}")
+    logger.error(traceback.format_exc())
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     return jsonify({
-        'status': 'healthy',
-        'models_loaded': analyzer is not None and len(analyzer.models) > 0
+        'status': 'healthy' if analyzer else 'unhealthy',
+        'models_loaded': analyzer is not None and len(analyzer.models) > 0,
+        'num_models': len(analyzer.models) if analyzer else 0
     })
 
 @app.route('/api/analyze-code', methods=['POST'])
@@ -329,6 +355,8 @@ def analyze_single_code():
         return jsonify(response), 200
         
     except Exception as e:
+        logger.error(f"Error in analyze_single_code: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({
             'error': str(e),
             'traceback': traceback.format_exc()
@@ -347,7 +375,7 @@ def analyze_github_repository():
             return jsonify({'error': 'Missing "github_url" field in request body'}), 400
         
         github_url = data['github_url']
-        max_files = data.get('max_files', 20)
+        max_files = min(data.get('max_files', 20), 50)  # Limit to 50 files max
         
         # Parse GitHub URL
         owner, repo = GitHubRepoAnalyzer.parse_github_url(github_url)
@@ -373,7 +401,7 @@ def analyze_github_repository():
                     result = analyzer.analyze_file(file_info['path'], code)
                     file_results.append(asdict(result))
                 except Exception as e:
-                    print(f"Error analyzing {file_info['path']}: {str(e)}")
+                    logger.warning(f"Error analyzing {file_info['path']}: {str(e)}")
         
         if not file_results:
             return jsonify({'error': 'Failed to analyze any files'}), 500
@@ -383,7 +411,7 @@ def analyze_github_repository():
         ai_files = sum(1 for f in file_results if f['prediction'] == "ai")
         human_files = total_files - ai_files
         
-        avg_confidence = np.mean([f['confidence'] for f in file_results])
+        avg_confidence = float(np.mean([f['confidence'] for f in file_results]))
         total_lines = sum(f['line_count'] for f in file_results)
         total_ai_lines = sum(f['ai_lines'] for f in file_results)
         total_human_lines = sum(f['human_lines'] for f in file_results)
@@ -401,7 +429,7 @@ def analyze_github_repository():
                 'human_files': human_files,
                 'ai_percentage': (ai_files / total_files) * 100,
                 'human_percentage': (human_files / total_files) * 100,
-                'avg_confidence': float(avg_confidence),
+                'avg_confidence': avg_confidence,
                 'total_lines': total_lines,
                 'total_ai_lines': total_ai_lines,
                 'total_human_lines': total_human_lines,
@@ -414,6 +442,8 @@ def analyze_github_repository():
         return jsonify(response), 200
         
     except Exception as e:
+        logger.error(f"Error in analyze_github_repository: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({
             'error': str(e),
             'traceback': traceback.format_exc()
@@ -425,6 +455,8 @@ def index():
     return jsonify({
         'service': 'AI vs Human Code Detector API',
         'version': '1.0.0',
+        'status': 'running',
+        'models_loaded': analyzer is not None and len(analyzer.models) > 0,
         'endpoints': {
             '/health': {
                 'method': 'GET',
@@ -442,7 +474,7 @@ def index():
                 'description': 'Analyze a GitHub repository',
                 'body': {
                     'github_url': 'string (required) - GitHub repository URL',
-                    'max_files': 'integer (optional, default: 20) - Maximum files to analyze'
+                    'max_files': 'integer (optional, default: 20, max: 50) - Maximum files to analyze'
                 }
             }
         }

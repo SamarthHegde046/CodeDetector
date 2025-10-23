@@ -1,12 +1,17 @@
-import streamlit as st
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import joblib
 import numpy as np
 import re
 import requests
-import base64
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
+import traceback
+import os
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for MERN frontend
 
 @dataclass
 class ModelResult:
@@ -33,7 +38,7 @@ class FileAnalysisResult:
     line_count: int
     ai_lines: int
     human_lines: int
-    model_results: List[ModelResult]
+    model_results: List[Dict]
 
 class GitHubRepoAnalyzer:
     """Class for analyzing GitHub repositories"""
@@ -64,7 +69,7 @@ class GitHubRepoAnalyzer:
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            st.error(f"Error fetching repo contents: {str(e)}")
+            print(f"Error fetching repo contents: {str(e)}")
             return []
     
     @staticmethod
@@ -80,7 +85,6 @@ class GitHubRepoAnalyzer:
             if item['type'] == 'file' and item['name'].endswith('.py'):
                 python_files.append(item)
             elif item['type'] == 'dir':
-                # Recursively get files from subdirectories
                 subdir_files = GitHubRepoAnalyzer.get_all_python_files(owner, repo, item['path'])
                 python_files.extend(subdir_files)
         
@@ -94,7 +98,7 @@ class GitHubRepoAnalyzer:
             response.raise_for_status()
             return response.text
         except Exception as e:
-            st.warning(f"Error downloading file: {str(e)}")
+            print(f"Error downloading file: {str(e)}")
             return None
 
 class CodeAnalyzer:
@@ -120,19 +124,19 @@ class CodeAnalyzer:
                 if Path(path).exists():
                     self.models[name] = joblib.load(path)
                 else:
-                    st.warning(f"Model {name} not found at {path}")
+                    print(f"Warning: Model {name} not found at {path}")
             
             if Path('model/vectorizer.pkl').exists():
                 self.vectorizer = joblib.load('model/vectorizer.pkl')
             else:
-                st.error("Vectorizer not found!")
-                return
+                raise Exception("Vectorizer not found!")
             
             if Path('model/labelencoder.pkl').exists():
                 self.label_encoder = joblib.load('model/labelencoder.pkl')
                 
         except Exception as e:
-            st.error(f"Error loading models: {str(e)}")
+            print(f"Error loading models: {str(e)}")
+            raise
     
     def predict_with_model(self, X: np.ndarray, model_name: str) -> Optional[ModelResult]:
         """Make prediction with a specific model"""
@@ -151,7 +155,7 @@ class CodeAnalyzer:
             else:
                 prediction = model.predict(X)[0]
             
-            confidence = model.predict_proba(X).max()
+            confidence = float(model.predict_proba(X).max())
             
             return ModelResult(
                 name=model_name.replace('_', ' ').title(),
@@ -160,7 +164,7 @@ class CodeAnalyzer:
             )
             
         except Exception as e:
-            st.warning(f"Error with {model_name}: {str(e)}")
+            print(f"Error with {model_name}: {str(e)}")
             return None
     
     def analyze_code(self, code: str) -> Tuple[List[ModelResult], str, float]:
@@ -192,9 +196,9 @@ class CodeAnalyzer:
         human_score = np.mean(human_votes) * len(human_votes) if human_votes else 0
         
         if ai_score > human_score:
-            return "ai", ai_score / len(results)
+            return "ai", float(ai_score / len(results))
         else:
-            return "human", human_score / len(results)
+            return "human", float(human_score / len(results))
     
     def analyze_lines(self, code: str, model_name: str = 'gradient_boost') -> List[LineAnalysis]:
         """Perform line-by-line analysis"""
@@ -220,7 +224,7 @@ class CodeAnalyzer:
                             patterns=patterns
                         ))
                         
-                except Exception as e:
+                except Exception:
                     continue
         
         return line_analyses
@@ -240,7 +244,7 @@ class CodeAnalyzer:
             line_count=len([l for l in code.split('\n') if l.strip()]),
             ai_lines=ai_lines,
             human_lines=human_lines,
-            model_results=results
+            model_results=[asdict(r) for r in results]
         )
     
     def detect_patterns(self, line: str) -> List[str]:
@@ -270,407 +274,180 @@ class CodeAnalyzer:
         
         return patterns
 
-class SummarizationEngine:
-    """Enhanced summarization engine for code analysis results"""
-    
-    @staticmethod
-    def generate_summary(results: List[ModelResult], final_pred: str, 
-                        line_analyses: List[LineAnalysis]) -> Dict[str, str]:
-        """Generate comprehensive analysis summary"""
-        
-        consensus = SummarizationEngine._analyze_consensus(results, final_pred)
-        patterns = SummarizationEngine._analyze_patterns(line_analyses)
-        distribution = SummarizationEngine._analyze_distribution(line_analyses)
-        reasoning = SummarizationEngine._generate_reasoning(
-            final_pred, consensus, patterns, distribution
-        )
-        
-        return {
-            'consensus': consensus,
-            'patterns': patterns,
-            'distribution': distribution,
-            'reasoning': reasoning
-        }
-    
-    @staticmethod
-    def _analyze_consensus(results: List[ModelResult], final_pred: str) -> str:
-        """Analyze model consensus"""
-        if not results:
-            return "No models available for analysis."
-        
-        ai_count = sum(1 for r in results if r.prediction == "ai")
-        total = len(results)
-        
-        if ai_count == total:
-            return f"All {total} models unanimously predict AI-generated code."
-        elif ai_count == 0:
-            return f"All {total} models unanimously predict human-written code."
-        else:
-            return f"{ai_count}/{total} models predict AI-generated, {total-ai_count}/{total} predict human-written."
-    
-    @staticmethod
-    def _analyze_patterns(line_analyses: List[LineAnalysis]) -> str:
-        """Analyze detected patterns"""
-        if not line_analyses:
-            return "No patterns detected."
-        
-        pattern_counts = {}
-        ai_patterns = {}
-        human_patterns = {}
-        
-        for analysis in line_analyses:
-            for pattern in analysis.patterns:
-                pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
-                
-                if analysis.prediction == "ai":
-                    ai_patterns[pattern] = ai_patterns.get(pattern, 0) + 1
-                else:
-                    human_patterns[pattern] = human_patterns.get(pattern, 0) + 1
-        
-        top_patterns = sorted(pattern_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-        
-        if top_patterns:
-            pattern_text = f"Most common patterns: {', '.join([p[0] for p in top_patterns])}. "
-            
-            ai_indicators = [p for p, count in ai_patterns.items() if count > human_patterns.get(p, 0)]
-            human_indicators = [p for p, count in human_patterns.items() if count > ai_patterns.get(p, 0)]
-            
-            if ai_indicators:
-                pattern_text += f"AI-leaning patterns: {', '.join(ai_indicators)}. "
-            if human_indicators:
-                pattern_text += f"Human-leaning patterns: {', '.join(human_indicators)}."
-                
-            return pattern_text
-        
-        return "No significant patterns detected."
-    
-    @staticmethod
-    def _analyze_distribution(line_analyses: List[LineAnalysis]) -> str:
-        """Analyze line prediction distribution"""
-        if not line_analyses:
-            return "No lines analyzed."
-        
-        ai_lines = [a for a in line_analyses if a.prediction == "ai"]
-        human_lines = [a for a in line_analyses if a.prediction == "human"]
-        
-        total = len(line_analyses)
-        ai_count = len(ai_lines)
-        human_count = len(human_lines)
-        
-        ai_pct = (ai_count / total) * 100
-        human_pct = (human_count / total) * 100
-        
-        avg_confidence = np.mean([a.confidence for a in line_analyses])
-        
-        return (f"{ai_count}/{total} lines ({ai_pct:.1f}%) flagged as AI-generated, "
-                f"{human_count}/{total} lines ({human_pct:.1f}%) as human-written. "
-                f"Average confidence: {avg_confidence:.2f}")
-    
-    @staticmethod
-    def _generate_reasoning(final_pred: str, consensus: str, patterns: str, distribution: str) -> str:
-        """Generate final reasoning explanation"""
-        reasoning = []
-        
-        if final_pred == "ai":
-            reasoning.append("🤖 **AI-Generated Code Detected**")
-            reasoning.append("The ensemble analysis suggests this code was likely generated by AI based on:")
-        else:
-            reasoning.append("👨‍💻 **Human-Written Code Detected**")
-            reasoning.append("The ensemble analysis suggests this code was likely written by a human based on:")
-        
-        reasoning.append(f"• **Model Consensus**: {consensus}")
-        reasoning.append(f"• **Pattern Analysis**: {patterns}")
-        reasoning.append(f"• **Line Distribution**: {distribution}")
-        
-        return "\n".join(reasoning)
-    
-    @staticmethod
-    def generate_repo_summary(file_results: List[FileAnalysisResult]) -> Dict:
-        """Generate repository-wide summary"""
-        if not file_results:
-            return {}
-        
-        total_files = len(file_results)
-        ai_files = sum(1 for f in file_results if f.prediction == "ai")
-        human_files = total_files - ai_files
-        
-        avg_confidence = np.mean([f.confidence for f in file_results])
-        total_lines = sum(f.line_count for f in file_results)
-        total_ai_lines = sum(f.ai_lines for f in file_results)
-        total_human_lines = sum(f.human_lines for f in file_results)
-        
-        return {
-            'total_files': total_files,
-            'ai_files': ai_files,
-            'human_files': human_files,
-            'ai_percentage': (ai_files / total_files) * 100,
-            'human_percentage': (human_files / total_files) * 100,
-            'avg_confidence': avg_confidence,
-            'total_lines': total_lines,
-            'total_ai_lines': total_ai_lines,
-            'total_human_lines': total_human_lines
-        }
+# Initialize analyzer globally
+try:
+    analyzer = CodeAnalyzer()
+    print("Models loaded successfully!")
+except Exception as e:
+    print(f"Failed to load models: {str(e)}")
+    analyzer = None
 
-def render_single_code_analysis():
-    """Render the single code analysis interface"""
-    st.markdown("## 📝 Analyze Single Code")
-    
-    if 'analyzer' not in st.session_state:
-        with st.spinner("Loading models..."):
-            st.session_state.analyzer = CodeAnalyzer()
-    
-    analyzer = st.session_state.analyzer
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        code_input = st.text_area(
-            "📝 Enter your Python code here:",
-            height=400,
-            placeholder="# Paste your Python code here...\nprint('Hello, World!')"
-        )
-    
-    with col2:
-        st.markdown("### ⚙️ Analysis Options")
-        
-        line_model = st.selectbox(
-            "Model for line analysis:",
-            ["gradient_boost", "random_forest", "logistic", "xgboost"],
-            help="Choose which model to use for line-by-line analysis"
-        )
-        
-        show_confidence = st.checkbox("Show confidence scores", value=True)
-        show_patterns = st.checkbox("Show detected patterns", value=True)
-    
-    if st.button("🔍 Analyze Code", type="primary", use_container_width=True):
-        if not code_input.strip():
-            st.warning("⚠️ Please enter some code to analyze.")
-            return
-        
-        with st.spinner("Analyzing code..."):
-            results, final_pred, final_conf = analyzer.analyze_code(code_input)
-            
-            if not results:
-                st.error("❌ Analysis failed. Please check if models are loaded correctly.")
-                return
-            
-            line_analyses = analyzer.analyze_lines(code_input, line_model)
-            summary = SummarizationEngine.generate_summary(results, final_pred, line_analyses)
-        
-        display_single_analysis_results(results, final_pred, final_conf, line_analyses, 
-                                       summary, show_confidence, show_patterns)
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'models_loaded': analyzer is not None and len(analyzer.models) > 0
+    })
 
-def render_github_repo_analysis():
-    """Render the GitHub repository analysis interface"""
-    st.markdown("## 🔗 Analyze GitHub Repository")
-    
-    if 'analyzer' not in st.session_state:
-        with st.spinner("Loading models..."):
-            st.session_state.analyzer = CodeAnalyzer()
-    
-    analyzer = st.session_state.analyzer
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        repo_url = st.text_input(
-            "🔗 Enter GitHub Repository URL:",
-            placeholder="https://github.com/username/repository",
-            help="Enter the full GitHub repository URL"
-        )
-    
-    with col2:
-        max_files = st.number_input(
-            "Max files to analyze:",
-            min_value=1,
-            max_value=100,
-            value=20,
-            help="Limit the number of files to analyze"
-        )
-    
-    if st.button("🔍 Analyze Repository", type="primary", use_container_width=True):
-        if not repo_url.strip():
-            st.warning("⚠️ Please enter a GitHub repository URL.")
-            return
+@app.route('/api/analyze-code', methods=['POST'])
+def analyze_single_code():
+    """Analyze a single code snippet"""
+    try:
+        if not analyzer:
+            return jsonify({'error': 'Models not loaded'}), 500
         
-        owner, repo = GitHubRepoAnalyzer.parse_github_url(repo_url)
+        data = request.get_json()
+        
+        if not data or 'code' not in data:
+            return jsonify({'error': 'Missing "code" field in request body'}), 400
+        
+        code = data['code']
+        
+        if not code.strip():
+            return jsonify({'error': 'Code cannot be empty'}), 400
+        
+        # Analyze code
+        results, final_pred, final_conf = analyzer.analyze_code(code)
+        line_analyses = analyzer.analyze_lines(code, 'gradient_boost')
+        
+        # Prepare response
+        response = {
+            'prediction': final_pred,
+            'confidence': final_conf,
+            'model_results': [asdict(r) for r in results],
+            'statistics': {
+                'total_lines': len([l for l in code.split('\n') if l.strip()]),
+                'ai_lines': sum(1 for a in line_analyses if a.prediction == "ai"),
+                'human_lines': sum(1 for a in line_analyses if a.prediction == "human"),
+                'ai_percentage': (sum(1 for a in line_analyses if a.prediction == "ai") / len(line_analyses) * 100) if line_analyses else 0,
+                'human_percentage': (sum(1 for a in line_analyses if a.prediction == "human") / len(line_analyses) * 100) if line_analyses else 0
+            },
+            'line_analyses': [asdict(a) for a in line_analyses[:50]]  # Limit to first 50 lines
+        }
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+
+@app.route('/api/analyze-repository', methods=['POST'])
+def analyze_github_repository():
+    """Analyze a GitHub repository"""
+    try:
+        if not analyzer:
+            return jsonify({'error': 'Models not loaded'}), 500
+        
+        data = request.get_json()
+        
+        if not data or 'github_url' not in data:
+            return jsonify({'error': 'Missing "github_url" field in request body'}), 400
+        
+        github_url = data['github_url']
+        max_files = data.get('max_files', 20)
+        
+        # Parse GitHub URL
+        owner, repo = GitHubRepoAnalyzer.parse_github_url(github_url)
         
         if not owner or not repo:
-            st.error("❌ Invalid GitHub URL. Please use format: https://github.com/owner/repo")
-            return
+            return jsonify({'error': 'Invalid GitHub URL format'}), 400
         
-        with st.spinner(f"Fetching files from {owner}/{repo}..."):
-            python_files = GitHubRepoAnalyzer.get_all_python_files(owner, repo)
+        # Get Python files
+        python_files = GitHubRepoAnalyzer.get_all_python_files(owner, repo)
         
         if not python_files:
-            st.warning("⚠️ No Python files found in the repository.")
-            return
+            return jsonify({'error': 'No Python files found in repository'}), 404
         
-        st.info(f"📂 Found {len(python_files)} Python files. Analyzing up to {max_files} files...")
-        
+        # Analyze files
         file_results = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
         files_to_analyze = python_files[:max_files]
         
-        for idx, file_info in enumerate(files_to_analyze):
-            status_text.text(f"Analyzing: {file_info['path']} ({idx + 1}/{len(files_to_analyze)})")
-            
+        for file_info in files_to_analyze:
             code = GitHubRepoAnalyzer.get_file_content(file_info['download_url'])
             
             if code:
                 try:
                     result = analyzer.analyze_file(file_info['path'], code)
-                    file_results.append(result)
+                    file_results.append(asdict(result))
                 except Exception as e:
-                    st.warning(f"Error analyzing {file_info['path']}: {str(e)}")
-            
-            progress_bar.progress((idx + 1) / len(files_to_analyze))
+                    print(f"Error analyzing {file_info['path']}: {str(e)}")
         
-        status_text.empty()
-        progress_bar.empty()
+        if not file_results:
+            return jsonify({'error': 'Failed to analyze any files'}), 500
         
-        if file_results:
-            display_repo_analysis_results(file_results, owner, repo)
-        else:
-            st.error("❌ Failed to analyze any files from the repository.")
-
-def display_single_analysis_results(results, final_pred, final_conf, line_analyses, 
-                                   summary, show_confidence, show_patterns):
-    """Display results for single code analysis"""
-    st.markdown("## 📊 Analysis Results")
-    
-    col1, col2, col3 = st.columns([1, 1, 1])
-    
-    with col1:
-        if final_pred == "ai":
-            st.error(f"🤖 **AI-Generated**")
-            st.metric("Confidence", f"{final_conf:.1%}")
-        else:
-            st.success(f"👨‍💻 **Human-Written**")
-            st.metric("Confidence", f"{final_conf:.1%}")
-    
-    with col2:
-        ai_count = sum(1 for r in results if r.prediction == "ai")
-        st.metric("Models Voting AI", f"{ai_count}/{len(results)}")
-    
-    with col3:
-        avg_conf = np.mean([r.confidence for r in results])
-        st.metric("Average Confidence", f"{avg_conf:.1%}")
-    
-    st.markdown("### 🔬 Individual Model Predictions")
-    
-    for result in results:
-        col1, col2, col3 = st.columns([2, 1, 1])
+        # Calculate repository summary
+        total_files = len(file_results)
+        ai_files = sum(1 for f in file_results if f['prediction'] == "ai")
+        human_files = total_files - ai_files
         
-        with col1:
-            st.write(f"**{result.name}**")
+        avg_confidence = np.mean([f['confidence'] for f in file_results])
+        total_lines = sum(f['line_count'] for f in file_results)
+        total_ai_lines = sum(f['ai_lines'] for f in file_results)
+        total_human_lines = sum(f['human_lines'] for f in file_results)
         
-        with col2:
-            if result.prediction == "ai":
-                st.write("🤖 AI-Generated")
-            else:
-                st.write("👨‍💻 Human-Written")
-        
-        with col3:
-            if show_confidence:
-                st.write(f"{result.confidence:.1%}")
-    
-    st.markdown("### 🧠 Analysis Summary")
-    st.markdown(summary['reasoning'])
-    
-    with st.expander("📈 Detailed Statistics"):
-        st.write("**Consensus Analysis:**", summary['consensus'])
-        st.write("**Pattern Analysis:**", summary['patterns'])
-        st.write("**Distribution Analysis:**", summary['distribution'])
-
-def display_repo_analysis_results(file_results: List[FileAnalysisResult], owner: str, repo: str):
-    """Display results for repository analysis"""
-    st.markdown("## 📊 Repository Analysis Results")
-    st.markdown(f"### Repository: `{owner}/{repo}`")
-    
-    repo_summary = SummarizationEngine.generate_repo_summary(file_results)
-    
-    # Overall statistics
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("Total Files", repo_summary['total_files'])
-    
-    with col2:
-        st.metric("AI-Generated", f"{repo_summary['ai_files']} ({repo_summary['ai_percentage']:.1f}%)")
-    
-    with col3:
-        st.metric("Human-Written", f"{repo_summary['human_files']} ({repo_summary['human_percentage']:.1f}%)")
-    
-    with col4:
-        st.metric("Avg Confidence", f"{repo_summary['avg_confidence']:.1%}")
-    
-    # Visualization
-    st.markdown("### 📈 Distribution Overview")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("#### Files by Prediction")
-        chart_data = {
-            'AI-Generated': repo_summary['ai_files'],
-            'Human-Written': repo_summary['human_files']
+        response = {
+            'repository': {
+                'owner': owner,
+                'name': repo,
+                'url': github_url
+            },
+            'summary': {
+                'total_files_found': len(python_files),
+                'files_analyzed': total_files,
+                'ai_files': ai_files,
+                'human_files': human_files,
+                'ai_percentage': (ai_files / total_files) * 100,
+                'human_percentage': (human_files / total_files) * 100,
+                'avg_confidence': float(avg_confidence),
+                'total_lines': total_lines,
+                'total_ai_lines': total_ai_lines,
+                'total_human_lines': total_human_lines,
+                'ai_lines_percentage': (total_ai_lines / (total_ai_lines + total_human_lines) * 100) if (total_ai_lines + total_human_lines) > 0 else 0,
+                'human_lines_percentage': (total_human_lines / (total_ai_lines + total_human_lines) * 100) if (total_ai_lines + total_human_lines) > 0 else 0
+            },
+            'files': file_results
         }
-        st.bar_chart(chart_data)
-    
-    with col2:
-        st.markdown("#### Lines by Prediction")
-        line_data = {
-            'AI Lines': repo_summary['total_ai_lines'],
-            'Human Lines': repo_summary['total_human_lines']
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+
+@app.route('/', methods=['GET'])
+def index():
+    """Root endpoint with API documentation"""
+    return jsonify({
+        'service': 'AI vs Human Code Detector API',
+        'version': '1.0.0',
+        'endpoints': {
+            '/health': {
+                'method': 'GET',
+                'description': 'Health check endpoint'
+            },
+            '/api/analyze-code': {
+                'method': 'POST',
+                'description': 'Analyze a single code snippet',
+                'body': {
+                    'code': 'string (required) - Python code to analyze'
+                }
+            },
+            '/api/analyze-repository': {
+                'method': 'POST',
+                'description': 'Analyze a GitHub repository',
+                'body': {
+                    'github_url': 'string (required) - GitHub repository URL',
+                    'max_files': 'integer (optional, default: 20) - Maximum files to analyze'
+                }
+            }
         }
-        st.bar_chart(line_data)
-    
-    # Detailed file results
-    st.markdown("### 📁 Detailed File Analysis")
-    
-    # Sort by confidence
-    sorted_files = sorted(file_results, key=lambda x: x.confidence, reverse=True)
-    
-    for file_result in sorted_files:
-        with st.expander(f"{'🤖' if file_result.prediction == 'ai' else '👨‍💻'} {file_result.file_path} - {file_result.prediction.upper()} ({file_result.confidence:.1%})"):
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("Confidence", f"{file_result.confidence:.1%}")
-            
-            with col2:
-                st.metric("Total Lines", file_result.line_count)
-            
-            with col3:
-                ai_line_pct = (file_result.ai_lines / (file_result.ai_lines + file_result.human_lines) * 100) if (file_result.ai_lines + file_result.human_lines) > 0 else 0
-                st.metric("AI Lines", f"{file_result.ai_lines} ({ai_line_pct:.1f}%)")
-            
-            st.markdown("**Model Predictions:**")
-            for model_result in file_result.model_results:
-                st.write(f"- {model_result.name}: {model_result.prediction.upper()} ({model_result.confidence:.1%})")
+    })
 
-def main():
-    st.set_page_config(
-        page_title="AI vs Human Code Detector",
-        page_icon="🤖",
-        layout="wide"
-    )
-    
-    st.title("🤖 AI vs Human Code Detector")
-    st.markdown("**Advanced ensemble analysis with GitHub repository support**")
-    st.markdown("---")
-    
-    # Tabs for different analysis modes
-    tab1, tab2 = st.tabs(["📝 Single Code Analysis", "🔗 GitHub Repository Analysis"])
-    
-    with tab1:
-        render_single_code_analysis()
-    
-    with tab2:
-        render_github_repo_analysis()
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)

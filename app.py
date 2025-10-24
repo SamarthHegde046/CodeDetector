@@ -49,9 +49,6 @@ class FileAnalysisResult:
 class GitHubRepoAnalyzer:
     """Class for analyzing GitHub repositories"""
     
-    # GitHub token from environment (optional, for higher rate limits)
-    GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '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')
-    
     @staticmethod
     def parse_github_url(url: str) -> Tuple[Optional[str], Optional[str]]:
         """Parse GitHub URL to extract owner and repo name"""
@@ -71,13 +68,10 @@ class GitHubRepoAnalyzer:
     @staticmethod
     def get_repo_contents(owner: str, repo: str, path: str = "") -> List[Dict]:
         """Get contents of a GitHub repository"""
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-        
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}" 
+
         try:
-            headers = {}
-            if GitHubRepoAnalyzer.GITHUB_TOKEN:
-                headers["Authorization"] = f"token {GitHubRepoAnalyzer.GITHUB_TOKEN}"
-            
+            headers = {"Authorization": "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"}
             response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
             return response.json()

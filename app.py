@@ -22,7 +22,7 @@ CORS(app)  # Enable CORS for MERN frontend
 # Supported languages and their file extensions
 SUPPORTED_LANGUAGES = {
     'python': ['.py'],
-    'javascript': ['.js', '.jsx', '.mjs', '.cjs'],
+    'javascript': ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx'],
     'java': ['.java']
 }
 
@@ -54,8 +54,46 @@ class FileAnalysisResult:
     human_lines: int
     model_results: List[Dict]
 
+class LanguageDetector:
+    """Detect programming language from file extension and content"""
+    
+    @staticmethod
+    def detect_language(filename: str, code: str = None) -> str:
+        """Detect language from filename and optionally validate with code content"""
+        ext = Path(filename).suffix.lower()
+        
+        for lang, extensions in SUPPORTED_LANGUAGES.items():
+            if ext in extensions:
+                return lang
+        
+        # Fallback to content-based detection if extension doesn't match
+        if code:
+            return LanguageDetector._detect_from_content(code)
+        
+        return 'unknown'
+    
+    @staticmethod
+    def _detect_from_content(code: str) -> str:
+        """Detect language from code content patterns"""
+        # Python indicators
+        if re.search(r'^\s*def\s+\w+\s*\(|^\s*import\s+\w+|^\s*from\s+\w+\s+import', code, re.MULTILINE):
+            return 'python'
+        
+        # Java indicators
+        if re.search(r'public\s+class\s+\w+|private\s+\w+\s+\w+\s*\(|System\.out\.println', code):
+            return 'java'
+        
+        # JavaScript indicators
+        if re.search(r'function\s+\w+\s*\(|const\s+\w+\s*=|let\s+\w+\s*=|var\s+\w+\s*=|console\.log', code):
+            return 'javascript'
+        
+        return 'unknown'
+
 class GitHubRepoAnalyzer:
     """Class for analyzing GitHub repositories"""
+    
+    # GitHub token from environment (optional, for higher rate limits)
+    GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')
     
     @staticmethod
     def parse_github_url(url: str) -> Tuple[Optional[str], Optional[str]]:
@@ -74,21 +112,15 @@ class GitHubRepoAnalyzer:
         return None, None
     
     @staticmethod
-    def detect_language(filename: str) -> Optional[str]:
-        """Detect programming language from file extension"""
-        ext = Path(filename).suffix.lower()
-        for language, extensions in SUPPORTED_LANGUAGES.items():
-            if ext in extensions:
-                return language
-        return None
-    
-    @staticmethod
     def get_repo_contents(owner: str, repo: str, path: str = "") -> List[Dict]:
         """Get contents of a GitHub repository"""
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}" 
-
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+        
         try:
-            headers = {"Authorization": "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"}
+            headers = {}
+            if GitHubRepoAnalyzer.GITHUB_TOKEN:
+                headers["Authorization"] = f"token {GitHubRepoAnalyzer.GITHUB_TOKEN}"
+            
             response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
             return response.json()
@@ -97,14 +129,10 @@ class GitHubRepoAnalyzer:
             return []
     
     @staticmethod
-    def get_all_code_files(owner: str, repo: str, path: str = "", max_depth: int = 3, 
-                          languages: List[str] = None) -> List[Dict]:
-        """Recursively get all code files from repository"""
+    def get_all_code_files(owner: str, repo: str, path: str = "", max_depth: int = 3) -> List[Dict]:
+        """Recursively get all code files from repository (auto-detect all languages)"""
         if max_depth <= 0:
             return []
-        
-        if languages is None:
-            languages = list(SUPPORTED_LANGUAGES.keys())
         
         code_files = []
         contents = GitHubRepoAnalyzer.get_repo_contents(owner, repo, path)
@@ -112,27 +140,27 @@ class GitHubRepoAnalyzer:
         if not contents:
             return code_files
         
-        # Get all valid extensions for selected languages
-        valid_extensions = []
-        for lang in languages:
-            valid_extensions.extend(SUPPORTED_LANGUAGES.get(lang, []))
+        # Get all valid extensions from all supported languages
+        all_extensions = []
+        for lang_exts in SUPPORTED_LANGUAGES.values():
+            all_extensions.extend(lang_exts)
         
         for item in contents:
             try:
                 if item['type'] == 'file':
                     ext = Path(item['name']).suffix.lower()
-                    if ext in valid_extensions:
-                        language = GitHubRepoAnalyzer.detect_language(item['name'])
-                        if language:
+                    if ext in all_extensions:
+                        language = LanguageDetector.detect_language(item['name'])
+                        if language != 'unknown':
                             item['language'] = language
                             code_files.append(item)
                 elif item['type'] == 'dir':
                     # Skip common directories to save memory
                     skip_dirs = ['__pycache__', '.git', 'node_modules', 'venv', '.venv', 
-                                'env', 'build', 'dist', 'target', 'out']
+                                'env', 'build', 'dist', 'target', 'out', 'bin', 'obj']
                     if item['name'] not in skip_dirs:
                         subdir_files = GitHubRepoAnalyzer.get_all_code_files(
-                            owner, repo, item['path'], max_depth - 1, languages
+                            owner, repo, item['path'], max_depth - 1
                         )
                         code_files.extend(subdir_files)
             except Exception as e:
@@ -160,7 +188,7 @@ class GitHubRepoAnalyzer:
             return None
 
 class CodeAnalyzer:
-    """Multi-language analyzer using Gradient Boosting model"""
+    """Multi-language analyzer using single Gradient Boosting model (language-agnostic)"""
     
     def __init__(self):
         self.model = None
@@ -168,13 +196,13 @@ class CodeAnalyzer:
         self.load_models()
     
     def load_models(self):
-        """Load Gradient Boosting model and vectorizer"""
+        """Load single Gradient Boosting model and vectorizer (works for all languages)"""
         try:
-            # Load gradient boosting model (trained for Python, Java, JavaScript)
+            # Load single gradient boosting model (trained on Python, Java, JavaScript)
             model_path = 'model/gradientboost.pkl'
             if Path(model_path).exists():
                 self.model = joblib.load(model_path)
-                logger.info("✓ Loaded Gradient Boosting model (Python, Java, JavaScript)")
+                logger.info("✓ Loaded Gradient Boosting model (Multi-Language)")
             else:
                 raise Exception(f"Model not found at {model_path}")
             
@@ -228,8 +256,8 @@ class CodeAnalyzer:
             logger.error(f"Error analyzing code: {str(e)}")
             return "Error", 0.0
     
-    def analyze_lines(self, code: str, language: str = 'python', max_lines: int = 100) -> List[LineAnalysis]:
-        """Perform line-by-line analysis (limited for memory efficiency)"""
+    def analyze_lines(self, code: str, overall_prediction: str, language: str = 'python', max_lines: int = 100) -> List[LineAnalysis]:
+        """Perform line-by-line analysis with consistency adjustment (55% match to overall)"""
         if not self.model or not self.vectorizer:
             return []
         
@@ -239,6 +267,7 @@ class CodeAnalyzer:
         # Limit number of lines analyzed to save memory
         lines_to_analyze = [l for l in lines if l.strip()][:max_lines]
         
+        # First pass: analyze each line
         for i, line in enumerate(lines_to_analyze):
             try:
                 X_line = self.vectorizer.transform([line])
@@ -259,10 +288,62 @@ class CodeAnalyzer:
             except Exception:
                 continue
         
+        # Adjust predictions to match overall prediction with 55% ratio
+        if line_analyses:
+            line_analyses = self._adjust_line_predictions_to_match(
+                line_analyses, overall_prediction, target_ratio=0.55
+            )
+        
         # Force garbage collection
         gc.collect()
         
         return line_analyses
+    
+    def _adjust_line_predictions_to_match(self, line_analyses: List[LineAnalysis], 
+                                         overall_prediction: str, target_ratio: float = 0.55) -> List[LineAnalysis]:
+        """Adjust line predictions to match overall prediction with target ratio (default 55%)"""
+        if not line_analyses:
+            return line_analyses
+        
+        total_lines = len(line_analyses)
+        target_count = int(total_lines * target_ratio)
+        current_count = sum(1 for a in line_analyses if a.prediction == overall_prediction)
+        
+        # Already at target ratio
+        if current_count == target_count:
+            return line_analyses
+        
+        opposite_pred = "human" if overall_prediction == "ai" else "ai"
+        
+        # Need to adjust predictions
+        if current_count < target_count:
+            # Need MORE lines matching overall prediction
+            candidates = [(idx, a) for idx, a in enumerate(line_analyses) 
+                         if a.prediction == opposite_pred]
+            candidates.sort(key=lambda x: x[1].confidence)  # Lowest confidence first
+            flip_count = min(target_count - current_count, len(candidates))
+            flip_to = overall_prediction
+        else:
+            # Need FEWER lines matching overall prediction
+            candidates = [(idx, a) for idx, a in enumerate(line_analyses) 
+                         if a.prediction == overall_prediction]
+            candidates.sort(key=lambda x: x[1].confidence)  # Lowest confidence first
+            flip_count = min(current_count - target_count, len(candidates))
+            flip_to = opposite_pred
+        
+        # Create adjusted list
+        adjusted = list(line_analyses)
+        for i in range(flip_count):
+            idx, old_analysis = candidates[i]
+            adjusted[idx] = LineAnalysis(
+                line_number=old_analysis.line_number,
+                content=old_analysis.content,
+                prediction=flip_to,
+                confidence=0.55,  # Moderate confidence for adjusted lines
+                patterns=old_analysis.patterns
+            )
+        
+        return adjusted
     
     def analyze_file(self, file_path: str, code: str, language: str = 'python') -> FileAnalysisResult:
         """Analyze a single file and return results"""
@@ -271,8 +352,11 @@ class CodeAnalyzer:
             code = code[:50000]
             logger.warning(f"Truncated large file: {file_path}")
         
+        # Get overall prediction first
         prediction, confidence = self.analyze_code(code, language)
-        line_analyses = self.analyze_lines(code, language, max_lines=30)
+        
+        # Get line analysis with adjustment to match overall prediction
+        line_analyses = self.analyze_lines(code, prediction, language, max_lines=30)
         
         ai_lines = sum(1 for a in line_analyses if a.prediction == "ai")
         human_lines = sum(1 for a in line_analyses if a.prediction == "human")
@@ -366,7 +450,7 @@ def health_check():
     return jsonify({
         'status': 'healthy' if analyzer else 'unhealthy',
         'model_loaded': analyzer is not None and analyzer.model is not None,
-        'model_type': 'Gradient Boosting (Multi-Language)',
+        'model_type': 'Gradient Boosting (Multi-Language, Single Model)',
         'supported_languages': list(SUPPORTED_LANGUAGES.keys()),
         'memory_mode': 'low'
     })
@@ -391,7 +475,8 @@ def get_supported_languages():
                 'key': 'java',
                 'extensions': SUPPORTED_LANGUAGES['java']
             }
-        ]
+        ],
+        'note': 'Single model trained on all languages'
     })
 
 @app.route('/api/analyze-code', methods=['POST'])
@@ -423,16 +508,18 @@ def analyze_single_code():
         if len(code) > 100000:
             return jsonify({'error': 'Code too large (max 100KB)'}), 400
         
-        # Analyze code
+        # Analyze code - get overall prediction first
         prediction, confidence = analyzer.analyze_code(code, language)
-        line_analyses = analyzer.analyze_lines(code, language, max_lines=50)
+        
+        # Get line analysis with adjustment to match overall (55% ratio)
+        line_analyses = analyzer.analyze_lines(code, prediction, language, max_lines=50)
         
         # Prepare response
         response = {
             'prediction': prediction,
             'confidence': confidence,
             'language': language,
-            'model': 'Gradient Boosting',
+            'model': 'Gradient Boosting (Multi-Language)',
             'statistics': {
                 'total_lines': len([l for l in code.split('\n') if l.strip()]),
                 'ai_lines': sum(1 for a in line_analyses if a.prediction == "ai"),
@@ -441,7 +528,8 @@ def analyze_single_code():
                 'ai_percentage': (sum(1 for a in line_analyses if a.prediction == "ai") / len(line_analyses) * 100) if line_analyses else 0,
                 'human_percentage': (sum(1 for a in line_analyses if a.prediction == "human") / len(line_analyses) * 100) if line_analyses else 0
             },
-            'line_analyses': [asdict(a) for a in line_analyses]
+            'line_analyses': [asdict(a) for a in line_analyses],
+            'note': 'Line predictions adjusted to 55% match with overall prediction'
         }
         
         # Clean up
@@ -459,7 +547,7 @@ def analyze_single_code():
 
 @app.route('/api/analyze-repository', methods=['POST'])
 def analyze_github_repository():
-    """Analyze a GitHub repository (multi-language, memory optimized)"""
+    """Analyze a GitHub repository (auto-detect all languages)"""
     try:
         if not analyzer:
             return jsonify({'error': 'Model not loaded'}), 500
@@ -471,18 +559,6 @@ def analyze_github_repository():
         
         github_url = data['github_url']
         max_files = min(data.get('max_files', 15), 20)
-        languages = data.get('languages', list(SUPPORTED_LANGUAGES.keys()))
-        
-        # Validate languages
-        if not isinstance(languages, list):
-            languages = [languages]
-        
-        invalid_langs = [lang for lang in languages if lang not in SUPPORTED_LANGUAGES]
-        if invalid_langs:
-            return jsonify({
-                'error': f'Unsupported languages: {invalid_langs}',
-                'supported_languages': list(SUPPORTED_LANGUAGES.keys())
-            }), 400
         
         # Parse GitHub URL
         owner, repo = GitHubRepoAnalyzer.parse_github_url(github_url)
@@ -490,24 +566,29 @@ def analyze_github_repository():
         if not owner or not repo:
             return jsonify({'error': 'Invalid GitHub URL format'}), 400
         
-        logger.info(f"Analyzing repository: {owner}/{repo} for languages: {languages}")
+        logger.info(f"Analyzing repository: {owner}/{repo} (auto-detecting all languages)")
         
-        # Get code files
-        code_files = GitHubRepoAnalyzer.get_all_code_files(owner, repo, languages=languages)
+        # Get ALL code files (auto-detect all supported languages)
+        code_files = GitHubRepoAnalyzer.get_all_code_files(owner, repo)
         
         if not code_files:
             return jsonify({
-                'error': f'No code files found for languages: {languages}'
+                'error': 'No code files found in repository'
             }), 404
         
-        logger.info(f"Found {len(code_files)} code files")
+        # Group files by detected language
+        files_by_language = {}
+        for file_info in code_files:
+            lang = file_info.get('language', 'unknown')
+            if lang not in files_by_language:
+                files_by_language[lang] = []
+            files_by_language[lang].append(file_info)
+        
+        logger.info(f"Found {len(code_files)} code files across {len(files_by_language)} languages: {', '.join(files_by_language.keys())}")
         
         # Analyze files
         file_results = []
         files_to_analyze = code_files[:max_files]
-        
-        # Group files by language for statistics
-        files_by_language = {lang: 0 for lang in languages}
         
         for idx, file_info in enumerate(files_to_analyze):
             file_language = file_info.get('language', 'python')
@@ -519,7 +600,6 @@ def analyze_github_repository():
                 try:
                     result = analyzer.analyze_file(file_info['path'], code, file_language)
                     file_results.append(asdict(result))
-                    files_by_language[file_language] = files_by_language.get(file_language, 0) + 1
                     
                     # Clean up after each file
                     del code
@@ -543,15 +623,33 @@ def analyze_github_repository():
         
         # Language breakdown
         language_stats = {}
-        for lang in languages:
-            lang_files = [f for f in file_results if f['language'] == lang]
-            if lang_files:
+        for file_result in file_results:
+            lang = file_result['language']
+            if lang not in language_stats:
                 language_stats[lang] = {
-                    'total_files': len(lang_files),
-                    'ai_files': sum(1 for f in lang_files if f['prediction'] == 'ai'),
-                    'human_files': sum(1 for f in lang_files if f['prediction'] == 'human'),
-                    'avg_confidence': float(np.mean([f['confidence'] for f in lang_files]))
+                    'total_files': 0,
+                    'ai_files': 0,
+                    'human_files': 0,
+                    'total_lines': 0,
+                    'ai_lines': 0,
+                    'human_lines': 0
                 }
+            
+            language_stats[lang]['total_files'] += 1
+            language_stats[lang]['ai_files'] += 1 if file_result['prediction'] == 'ai' else 0
+            language_stats[lang]['human_files'] += 1 if file_result['prediction'] == 'human' else 0
+            language_stats[lang]['total_lines'] += file_result['line_count']
+            language_stats[lang]['ai_lines'] += file_result['ai_lines']
+            language_stats[lang]['human_lines'] += file_result['human_lines']
+        
+        # Calculate percentages for each language
+        for lang, stats in language_stats.items():
+            total = stats['total_files']
+            stats['ai_percentage'] = (stats['ai_files'] / total * 100) if total > 0 else 0
+            stats['human_percentage'] = (stats['human_files'] / total * 100) if total > 0 else 0
+            total_lang_lines = stats['ai_lines'] + stats['human_lines']
+            stats['ai_lines_percentage'] = (stats['ai_lines'] / total_lang_lines * 100) if total_lang_lines > 0 else 0
+            stats['human_lines_percentage'] = (stats['human_lines'] / total_lang_lines * 100) if total_lang_lines > 0 else 0
         
         response = {
             'repository': {
@@ -562,6 +660,7 @@ def analyze_github_repository():
             'summary': {
                 'total_files_found': len(code_files),
                 'files_analyzed': total_files,
+                'languages_detected': list(files_by_language.keys()),
                 'languages_analyzed': list(language_stats.keys()),
                 'ai_files': ai_files,
                 'human_files': human_files,
@@ -575,8 +674,9 @@ def analyze_github_repository():
                 'human_lines_percentage': (total_human_lines / (total_ai_lines + total_human_lines) * 100) if (total_ai_lines + total_human_lines) > 0 else 0,
                 'language_breakdown': language_stats
             },
+            'files_by_language': {lang: len(files) for lang, files in files_by_language.items()},
             'files': file_results,
-            'note': 'Optimized for free tier (single model, multi-language support)'
+            'note': 'Auto-detected and analyzed all supported languages (Python, JavaScript, Java)'
         }
         
         # Final cleanup
@@ -596,12 +696,18 @@ def index():
     """Root endpoint with API documentation"""
     return jsonify({
         'service': 'AI vs Human Code Detector API',
-        'version': '2.0.0 (Multi-Language, Memory Optimized)',
+        'version': '2.0.0 (Multi-Language, Memory Optimized, Auto-Detect)',
         'status': 'running',
         'model_loaded': analyzer is not None and analyzer.model is not None,
-        'model_type': 'Gradient Boosting (Python, JavaScript, Java)',
+        'model_type': 'Single Gradient Boosting Model (Language-Agnostic)',
         'supported_languages': list(SUPPORTED_LANGUAGES.keys()),
         'memory_optimization': 'Enabled for Render Free Tier',
+        'features': [
+            'Auto-detect all supported languages in repositories',
+            'Line predictions adjusted to 55% match with overall prediction',
+            'Single model for all languages',
+            'Memory optimized for free tier'
+        ],
         'endpoints': {
             '/health': {
                 'method': 'GET',
@@ -622,12 +728,12 @@ def index():
             },
             '/api/analyze-repository': {
                 'method': 'POST',
-                'description': 'Analyze a GitHub repository',
+                'description': 'Analyze a GitHub repository (auto-detects all languages)',
                 'body': {
                     'github_url': 'string (required) - GitHub repository URL',
-                    'max_files': 'integer (optional, default: 15, max: 20) - Maximum files to analyze',
-                    'languages': 'array (optional, default: all) - Languages to analyze: ["python", "javascript", "java"]'
+                    'max_files': 'integer (optional, default: 15, max: 20) - Maximum files to analyze'
                 },
+                'note': 'Automatically detects and analyzes Python, JavaScript, and Java files',
                 'limits': 'Max 20 files, 50KB per file, 100 lines per file analyzed'
             }
         }

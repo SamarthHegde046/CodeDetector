@@ -111,12 +111,11 @@ class GitHubRepoAnalyzer:
     @staticmethod
     def get_repo_contents(owner: str, repo: str, path: str = "") -> List[Dict]:
         """Get contents of a GitHub repository"""
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-        
-        try:
-            headers = {"Authorization": "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"}
-            response = requests.get(url, headers=headers)
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}" 
 
+        try:
+            headers = {"Authorization": "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"}
+            response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
             return response.json()
         except Exception as e:

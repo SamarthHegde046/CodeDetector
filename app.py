@@ -92,9 +92,6 @@ class LanguageDetector:
 class GitHubRepoAnalyzer:
     """Class for analyzing GitHub repositories"""
     
-    # GitHub token from environment (optional, for higher rate limits)
-    GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')
-    
     @staticmethod
     def parse_github_url(url: str) -> Tuple[Optional[str], Optional[str]]:
         """Parse GitHub URL to extract owner and repo name"""
@@ -117,11 +114,9 @@ class GitHubRepoAnalyzer:
         url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
         
         try:
-            headers = {}
-            if GitHubRepoAnalyzer.GITHUB_TOKEN:
-                headers["Authorization"] = f"token {GitHubRepoAnalyzer.GITHUB_TOKEN}"
-            
-            response = requests.get(url, headers=headers, timeout=10)
+            headers = {"Authorization": "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"}
+            response = requests.get(url, headers=headers)
+
             response.raise_for_status()
             return response.json()
         except Exception as e:
